@@ -34,10 +34,10 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("abyss_main_bot")
 
-CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+CHANNEL_ACCESS_TOKEN = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
+CHANNEL_SECRET = (os.getenv("LINE_CHANNEL_SECRET") or "").strip()
 # 익명 건의·신고를 수신할 방장 user_id(U...) 또는 운영진 전용방 group_id(C...)
-ADMIN_TARGET_ID = os.getenv("ADMIN_TARGET_ID", "").strip()
+ADMIN_TARGET_ID = (os.getenv("ADMIN_TARGET_ID") or "").strip()
 
 if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
     raise ValueError("LINE_CHANNEL_ACCESS_TOKEN과 LINE_CHANNEL_SECRET 환경 변수를 설정해주세요.")
@@ -118,7 +118,7 @@ def load_json_dict(path: str) -> dict:
         return {}
 
 
-def save_json_dict(path: str, data: dict):
+def save_json_dict(path: str, data: dict) -> None:
     """임시 파일 기록 후 os.replace()로 원자적 저장"""
     directory = os.path.dirname(path) or "/tmp"
     os.makedirs(directory, exist_ok=True)
@@ -177,4 +177,30 @@ def calculate_message_madit(text: str) -> int:
 
     count = 0
     for token in stripped.split():
-        if token.startswith("@
+        if token.startswith("@"):
+            continue
+        cleaned = re.sub(r"[^가-힣A-Za-z0-9]", "", token)
+        if len(cleaned) >= MIN_WORD_LEN:
+            count += 1
+
+    return count
+
+
+def register_chat_target(event) -> None:
+    """
+    자동 랭킹 전송 대상 등록 — 1:1 채팅 유저에게 전체 랭킹이 푸시되지 않도록
+    그룹(group_id) 또는 다인 채팅방(room_id)만 등록
+    """
+    source = getattr(event, "source", None)
+    if not source:
+        return
+
+    target_id = getattr(source, "group_id", None) or getattr(source, "room_id", None)
+    if not target_id:
+        return
+
+    if ADMIN_TARGET_ID and target_id == ADMIN_TARGET_ID:
+        return
+
+    with state_lock:
+        latest = load_
