@@ -1,4 +1,5 @@
 from datetime import datetime
+import hashlib
 import json
 import logging
 import os
@@ -35,6 +36,8 @@ logger = logging.getLogger("abyss_main_bot")
 
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+# 익명 건의·신고를 수신할 방장 user_id(U...) 또는 운영진 전용방 group_id(C...)
+ADMIN_TARGET_ID = os.getenv("ADMIN_TARGET_ID", "").strip()
 
 if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
     raise ValueError("LINE_CHANNEL_ACCESS_TOKEN과 LINE_CHANNEL_SECRET 환경 변수를 설정해주세요.")
@@ -47,6 +50,8 @@ KST = ZoneInfo("Asia/Seoul")
 RANKING_STORE_PATH = "/tmp/abyss_rankings.json"
 TARGETS_STORE_PATH = "/tmp/abyss_targets.json"
 MEMBERS_STORE_PATH = "/tmp/abyss_members.json"
+REPORTS_STORE_PATH = "/tmp/abyss_reports.json"
+
 # 같은 유저의 연타 도배 방지 최소 간격(초). 0으로 두면 모든 유효 메시지 카운트
 MIN_SPEECH_INTERVAL_SEC = 2.0
 # 일일 활동부족 경고 기준 마디 수 (30마디 미만 시 경고 표시)
@@ -54,8 +59,13 @@ MIN_ACTIVITY_MADIT = 30
 # 1개 메시지에서 인정되는 유효 단어(3글자 이상)의 최소 길이
 MIN_WORD_LEN = 3
 
+# 익명 건의·신고 도배 방지 쿨타임(초) 및 최소 내용 길이
+REPORT_COOLDOWN_SEC = 300
+MIN_REPORT_LEN = 5
+
 state_lock = threading.Lock()
 last_counted_at: dict[str, float] = {}
+last_reported_at: dict[str, float] = {}
 
 WELCOME_MSG = (
     "🌊 ━━━ 🐬 𝓐𝓑𝓨𝓢𝓢 🐬 ━━━ 🌊\n"
@@ -124,12 +134,28 @@ def save_json_dict(path: str, data: dict):
 ranking_data = load_json_dict(RANKING_STORE_PATH)
 targets_data = load_json_dict(TARGETS_STORE_PATH)
 members_data = load_json_dict(MEMBERS_STORE_PATH)
+reports_data = load_json_dict(REPORTS_STORE_PATH)
 
 
 def normalize_command(text: str) -> str:
     """앞뒤 공백 및 @멘션 토큰 제거 후 첫 명령어 토큰 반환"""
     tokens = [tok for tok in text.strip().split() if not tok.startswith("@")]
     return tokens[0] if tokens else ""
+
+
+def extract_command_payload(text: str, cmd: str) -> str:
+    """명령어 뒤의 본문 내용 추출"""
+    stripped = text.strip()
+    idx = stripped.find(cmd)
+    if idx == -1:
+        return ""
+    return stripped[idx + len(cmd):].strip()
+
+
+def make_anon_code(user_id: str) -> str:
+    """운영진도 실제 유저를 역추적할 수 없는 4자리 단방향 식별 코드"""
+    raw = f"{CHANNEL_SECRET}:{user_id}".encode("utf-8")
+    return "#" + hashlib.sha256(raw).hexdigest()[:4].upper()
 
 
 def calculate_message_madit(text: str) -> int:
@@ -153,17 +179,19 @@ def calculate_message_madit(text: str) -> int:
 
 
 def register_chat_target(event):
-    """자동 랭킹 전송 대상(group / room / user) 등록"""
+    """
+    자동 랭킹 전송 대상 등록 — 1:1 건의 유저에게 전체 랭킹이 푸시되지 않도록
+    그룹(group_id) 또는 다인 채팅방(room_id)만 등록
+    """
     source = getattr(event, "source", None)
     if not source:
         return
 
-    target_id = (
-        getattr(source, "group_id", None)
-        or getattr(source, "room_id", None)
-        or getattr(source, "user_id", None)
-    )
+    target_id = getattr(source, "group_id", None) or getattr(source, "room_id", None)
     if not target_id:
+        return
+
+    if ADMIN_TARGET_ID and target_id == ADMIN_TARGET_ID:
         return
 
     with state_lock:
@@ -179,7 +207,10 @@ def get_chat_targets() -> list[str]:
     with state_lock:
         latest = load_json_dict(TARGETS_STORE_PATH)
         targets_data.update(latest)
-        return list(targets_data.keys())
+        return [
+            tid for tid in targets_data.keys()
+            if not (ADMIN_TARGET_ID and tid == ADMIN_TARGET_ID)
+        ]
 
 
 def get_display_name_by_ids(
@@ -461,6 +492,145 @@ def format_all_ranking(header_prefix: str = "🏆") -> str:
     return "\n".join(lines)
 
 
+def format_inactive_members() -> str:
+    """오늘 발언 수가 MIN_ACTIVITY_MADIT(30마디) 미만인 인원만 모아 반환"""
+    day = today_key()
+    sync_group_members_from_api()
+    sorted_items = get_sorted_today_entries()
+
+    if not sorted_items:
+        return (
+            f"⚠️ [{day}] 활동부족 인원 ({MIN_ACTIVITY_MADIT}마디 미만)\n"
+            f"아직 등록된 멤버가 없습니다."
+        )
+
+    inactive_items = [
+        (uid, info)
+        for uid, info in sorted_items
+        if int(info.get("madit", 0)) < MIN_ACTIVITY_MADIT
+    ]
+
+    if not inactive_items:
+        return (
+            f"✅ [{day}] 활동부족 인원 ({MIN_ACTIVITY_MADIT}마디 미만)\n"
+            f"전원 기준({MIN_ACTIVITY_MADIT}마디 이상)을 충족했습니다!"
+        )
+
+    inactive_items.sort(
+        key=lambda kv: (int(kv[1].get("madit", 0)), str(kv[1].get("name", "")))
+    )
+
+    lines = [
+        f"⚠️ [{day}] 활동부족 인원 ({len(inactive_items)}명 / 전체 {len(sorted_items)}명 · 기준: {MIN_ACTIVITY_MADIT}마디 미만)"
+    ]
+    for idx, (_, info) in enumerate(inactive_items, start=1):
+        name = info.get("name") or "멤버"
+        count = int(info.get("madit", 0))
+        shortage = MIN_ACTIVITY_MADIT - count
+        lines.append(f"{idx}. {name} — {count}마디 (기준까지 {shortage}마디 부족)")
+
+    return "\n".join(lines)
+
+
+def save_and_forward_report(user_id: str, kind: str, content: str) -> tuple[bool, str]:
+    """
+    1:1 개인 채팅으로 접수된 건의·신고를 익명 코드화해 저장하고
+    ADMIN_TARGET_ID로 푸시 전달
+    """
+    if not ADMIN_TARGET_ID:
+        return (
+            False,
+            "⚠️ 현재 운영진 수신처가 아직 연결되지 않아 접수할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+        )
+
+    now_ts = time.monotonic()
+    with state_lock:
+        prev_ts = last_reported_at.get(user_id, 0.0)
+        elapsed = now_ts - prev_ts
+        if prev_ts > 0 and elapsed < REPORT_COOLDOWN_SEC:
+            remain_sec = int(REPORT_COOLDOWN_SEC - elapsed) + 1
+            return (
+                False,
+                f"⏳ 연속 접수 방지를 위해 {remain_sec}초 후에 다시 보낼 수 있습니다.",
+            )
+
+        now_kst_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+        anon_code = make_anon_code(user_id)
+
+        latest = load_json_dict(REPORTS_STORE_PATH)
+        reports_data.update(latest)
+        items = reports_data.setdefault("items", [])
+        if not isinstance(items, list):
+            items = []
+            reports_data["items"] = items
+
+        report_no = len(items) + 1
+        entry = {
+            "no": report_no,
+            "kind": kind,
+            "anon_code": anon_code,
+            "content": content,
+            "created_at": now_kst_str,
+        }
+        items.append(entry)
+        # 최근 100건까지만 유지
+        if len(items) > 100:
+            reports_data["items"] = items[-100:]
+        save_json_dict(REPORTS_STORE_PATH, reports_data)
+        last_reported_at[user_id] = now_ts
+
+    icon = "🚨" if kind == "신고" else "📩"
+    admin_text = (
+        f"{icon} [익명 {kind} #{report_no}]\n"
+        f"• 접수 시각: {now_kst_str}\n"
+        f"• 식별 코드: {anon_code}\n"
+        f"• 내용:\n{content}"
+    )
+
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=ADMIN_TARGET_ID,
+                    messages=[TextMessage(text=admin_text)],
+                )
+            )
+        logger.info("[REPORT] forwarded no=%d kind=%s code=%s", report_no, kind, anon_code)
+    except Exception:
+        logger.exception("[REPORT] failed to push report no=%d to ADMIN_TARGET_ID", report_no)
+        return (
+            False,
+            "⚠️ 운영진 알림 전송 중 일시적인 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+        )
+
+    return (
+        True,
+        f"✅ 익명 {kind}가 정상 접수되었습니다. (접수번호 #{report_no})\n운영진에게 발신자 정보 없이 안전하게 전달되었습니다.",
+    )
+
+
+def format_recent_reports(limit: int = 10) -> str:
+    with state_lock:
+        latest = load_json_dict(REPORTS_STORE_PATH)
+        reports_data.update(latest)
+        items = reports_data.get("items", [])
+        if not isinstance(items, list) or not items:
+            return "📋 접수된 익명 건의·신고 내역이 없습니다."
+        recent = list(reversed(items[-limit:]))
+
+    lines = [f"📋 최근 익명 건의·신고 내역 (최근 {len(recent)}건)"]
+    for r in recent:
+        no = r.get("no", "?")
+        kind = r.get("kind", "건의")
+        code = r.get("anon_code", "#----")
+        created_at = r.get("created_at", "")
+        content = r.get("content", "")
+        lines.append(f"\n[#{no} · {kind} · {code}] ({created_at})\n{content}")
+
+    return "\n".join(lines)
+
+
 def reply_messages(reply_token: str, texts: list[str]):
     messages = [TextMessage(text=t) for t in texts[:5]]
     try:
@@ -576,14 +746,60 @@ def handle_member_left(event):
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
-    register_chat_target(event)
+    source = getattr(event, "source", None)
+    user_id = getattr(source, "user_id", None)
+    group_id = getattr(source, "group_id", None)
+    room_id = getattr(source, "room_id", None)
+
+    is_group_or_room = bool(group_id or room_id)
+    is_private_chat = (not is_group_or_room) and bool(user_id)
+    chat_id = group_id or room_id or user_id or ""
+
+    if is_group_or_room:
+        register_chat_target(event)
+
     user_text = event.message.text.strip()
-    user_id = getattr(event.source, "user_id", None)
     cmd = normalize_command(user_text)
 
-    if user_id:
+    # 1) 초기 세팅용 ID 확인 명령어 (설정 완료 후 본방에서는 완전 숨김)
+    if cmd == "/방아이디":
+        if is_private_chat or (not ADMIN_TARGET_ID) or (ADMIN_TARGET_ID and chat_id == ADMIN_TARGET_ID):
+            reply_messages(event.reply_token, [f"🆔 현재 채팅 ID:\n{chat_id}"])
+        return
+
+    # 2) 운영진 전용 건의·신고 내역 조회 (본방에서는 완전 무응답)
+    if cmd == "/건의목록":
+        if ADMIN_TARGET_ID and chat_id == ADMIN_TARGET_ID:
+            reply_messages(event.reply_token, [format_recent_reports()])
+        return
+
+    # 3) 익명 건의·신고 접수 — 오직 1:1 개인 채팅에서만 동작, 본방에서는 완전 무응답
+    if cmd in ("/건의", "/신고"):
+        if not is_private_chat or not user_id:
+            return
+
+        kind = "신고" if cmd == "/신고" else "건의"
+        payload = extract_command_payload(user_text, cmd)
+        if len(payload) < MIN_REPORT_LEN:
+            reply_messages(
+                event.reply_token,
+                [
+                    f"📝 {kind} 내용을 {MIN_REPORT_LEN}글자 이상 함께 입력해 주세요.\n"
+                    f"예시) {cmd} 방 공지 관련 건의사항이 있습니다."
+                ],
+            )
+            return
+
+        _, result_msg = save_and_forward_report(user_id=user_id, kind=kind, content=payload)
+        reply_messages(event.reply_token, [result_msg])
+        return
+
+    # 이하 일반 본방 기능 (1:1 채팅 유저는 본방 멤버 목록에 섞지 않음)
+    if is_group_or_room and user_id:
         name = get_display_name(event)
         upsert_member(user_id, name)
+    elif user_id:
+        name = get_display_name(event)
     else:
         name = "익명"
 
@@ -592,7 +808,8 @@ def handle_message(event):
         return
 
     if cmd == "/내랭킹":
-        ensure_known_member(user_id, name)
+        if is_group_or_room:
+            ensure_known_member(user_id, name)
         reply_messages(event.reply_token, [format_my_ranking(user_id, name)])
         return
 
@@ -600,7 +817,11 @@ def handle_message(event):
         reply_messages(event.reply_token, [format_all_ranking()])
         return
 
-    if user_id:
+    if cmd == "/활동부족":
+        reply_messages(event.reply_token, [format_inactive_members()])
+        return
+
+    if is_group_or_room and user_id:
         gained_madit = calculate_message_madit(user_text)
         if gained_madit > 0:
             now_ts = time.monotonic()
